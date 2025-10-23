@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-Fetch Diluted EPS and Revenue quarter-over-quarter (or year-over-year) percentage growth
-for the last 5 quarters using Yahoo Finance via the yfinance library.
-
-This version prefers Diluted EPS (column names containing 'dilut') instead of
-reported/actual EPS. If no diluted EPS column is found in the earnings table,
-falls back to any EPS-like column only as a last resort.
+Fetch EPS (Diluted/Basic preferred) and Revenue quarter-over-quarter (or year-over-year)
+percentage growth for the last 5 quarters using Yahoo Finance via the yfinance library.
 
 Dependencies:
     pip install yfinance pandas python-dateutil
@@ -22,7 +18,7 @@ import yfinance as yf
 
 # -------- Configuration --------
 # Choose "qoq" for quarter-over-quarter or "yoy" for year-over-year comparisons.
-GROWTH_MODE = "qoq"
+GROWTH_MODE = "qoq"  # or "yoy"
 MAX_OUTPUT_PERIODS = 5  # how many most-recent growth points to show
 # --------------------------------
 
@@ -58,43 +54,61 @@ def _prep_growth(series: pd.Series, mode: str = "qoq") -> pd.DataFrame:
     ]
     return df.dropna(subset=["pct_growth"])
 
+# --- NEW: helper to find Diluted or Basic EPS rows robustly ---
+def _find_eps_row(idx) -> Optional[str]:
+    """
+    Given a Pandas Index of row labels, return the best label for EPS.
+    Preference: any label containing 'eps' and 'dilut' -> Diluted EPS;
+                otherwise any label containing 'eps' and 'basic' -> Basic EPS.
+    """
+    lowers = {str(i): str(i).lower() for i in idx}
+    diluted = [k for k, v in lowers.items() if "eps" in v and "dilut" in v]
+    if diluted:
+        return diluted[0]
+    basic = [k for k, v in lowers.items() if "eps" in v and "basic" in v]
+    if basic:
+        return basic[0]
+    return None
+
 def _extract_eps_series(tkr: yf.Ticker) -> pd.Series:
     """
-    Try to obtain a quarterly Diluted or Basic EPS series from Yahoo Finance.
-    Returns a Series indexed by quarter end (datetime), values are EPS (float).
-    Priority: Diluted EPS -> Basic EPS -> fallback to EPS Actual.
+    Pull quarterly Diluted (preferred) or Basic EPS from Yahoo Finance via yfinance.
+    Tries quarterly_income_stmt first (newer), then quarterly_financials (older).
+    Falls back to earnings 'EPS Actual/Reported' only if neither is available.
+    Returns a Series indexed by quarter end timestamps.
     """
-    # Try quarterly financials first
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        qfin = tkr.quarterly_financials
+        # Some yfinance versions expose quarterly income statement as 'quarterly_income_stmt'
+        qis = getattr(tkr, "quarterly_income_stmt", None)
+        qfin = getattr(tkr, "quarterly_financials", None)
 
+    # 1) Try quarterly_income_stmt
+    if qis is not None and not qis.empty:
+        row = _find_eps_row(qis.index)
+        if row is not None:
+            s = pd.to_numeric(qis.loc[row], errors="coerce")
+            s.index = pd.to_datetime(s.index, errors="coerce")
+            s = s.dropna().sort_index()
+            if not s.empty:
+                return s
+
+    # 2) Fall back to quarterly_financials
     if qfin is not None and not qfin.empty:
-        eps_row = None
-        for candidate in ["Diluted EPS", "DilutedEPS", "EPS Diluted", "epsDiluted"]:
-            if candidate in qfin.index:
-                eps_row = candidate
-                break
+        row = _find_eps_row(qfin.index)
+        if row is not None:
+            s = pd.to_numeric(qfin.loc[row], errors="coerce")
+            s.index = pd.to_datetime(s.index, errors="coerce")
+            s = s.dropna().sort_index()
+            if not s.empty:
+                return s
 
-        if eps_row is None:
-            for candidate in ["Basic EPS", "BasicEPS", "EPS Basic", "epsBasic"]:
-                if candidate in qfin.index:
-                    eps_row = candidate
-                    break
-
-        if eps_row:
-            eps = pd.to_numeric(qfin.loc[eps_row], errors="coerce")
-            eps.index = pd.to_datetime(eps.index, errors="coerce")
-            eps = eps.dropna().sort_index()
-            if not eps.empty:
-                return eps
-
-    # Fallback: if Diluted/Basic EPS not found, use legacy "EPS Actual"
+    # 3) Last-resort fallback: earnings calendar EPS (Actual/Reported)
     eps_df = None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            eps_df = tkr.get_earnings_dates(limit=40)
+            eps_df = tkr.get_earnings_dates(limit=40)  # recent rows first
         except Exception:
             pass
 
@@ -107,22 +121,40 @@ def _extract_eps_series(tkr: yf.Ticker) -> pd.Series:
     if eps_df is None or eps_df.empty:
         return pd.Series(dtype=float)
 
-    # Look for any EPS column if fallback is needed
+    # Use any EPS-like column available (e.g., 'EPS Actual', 'Reported EPS')
     col_candidates = [c for c in eps_df.columns if "eps" in c.lower()]
     if not col_candidates:
         return pd.Series(dtype=float)
 
     eps_col = col_candidates[0]
+
+    # Ensure datetime index
+    if "Earnings Date" in eps_df.columns:
+        eps_df = eps_df.set_index("Earnings Date")
+    elif eps_df.index.name and "date" in str(eps_df.index.name).lower():
+        pass
+    else:
+        try:
+            first_col = eps_df.columns[0]
+            maybe_dt = pd.to_datetime(eps_df[first_col], errors="coerce")
+            if maybe_dt.notna().any():
+                eps_df = eps_df.set_index(maybe_dt)
+            else:
+                eps_df.index = pd.to_datetime(eps_df.index, errors="coerce")
+        except Exception:
+            eps_df.index = pd.to_datetime(eps_df.index, errors="coerce")
+
     eps_df.index = pd.to_datetime(eps_df.index, errors="coerce")
     eps_df = eps_df[eps_df.index.notna()].sort_index()
+
     eps_series = pd.to_numeric(eps_df[eps_col], errors="coerce").dropna()
+    if eps_series.empty:
+        return pd.Series(dtype=float)
 
-    # Group by quarter (last EPS per quarter)
-    if not eps_series.empty:
-        qidx = eps_series.index.to_period("Q")
-        eps_series = eps_series.groupby(qidx).last()
-        eps_series.index = eps_series.index.to_timestamp(how="end")
-
+    # One value per quarter (take the last in each quarter)
+    qidx = eps_series.index.to_period("Q")
+    eps_series = eps_series.groupby(qidx).last()
+    eps_series.index = eps_series.index.to_timestamp(how="end")
     return eps_series
 
 def _extract_revenue_series(tkr: yf.Ticker) -> pd.Series:
@@ -137,6 +169,7 @@ def _extract_revenue_series(tkr: yf.Ticker) -> pd.Series:
     if qfin is None or qfin.empty:
         return pd.Series(dtype=float)
 
+    # Yahoo often uses 'Total Revenue'; fall back to close matches.
     row = None
     for candidate in ["Total Revenue", "TotalRevenue", "totalRevenue", "Revenue", "Total revenue"]:
         if candidate in qfin.index:
@@ -153,8 +186,7 @@ def _extract_revenue_series(tkr: yf.Ticker) -> pd.Series:
 
     rev = pd.to_numeric(qfin.loc[row], errors="coerce")
     rev.index = pd.to_datetime(rev.index, errors="coerce")
-    rev = rev.dropna()
-    rev = rev.sort_index()
+    rev = rev.dropna().sort_index()
     return rev
 
 def fetch_growth_for_ticker(ticker: str, mode: str = GROWTH_MODE) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -166,7 +198,7 @@ def fetch_growth_for_ticker(ticker: str, mode: str = GROWTH_MODE) -> Tuple[pd.Da
     """
     tk = yf.Ticker(ticker)
 
-    # Diluted EPS
+    # EPS (Diluted or Basic preferred)
     eps_series = _extract_eps_series(tk)
     eps_growth_full = _prep_growth(eps_series, mode=mode)
     eps_growth = eps_growth_full.tail(MAX_OUTPUT_PERIODS)
@@ -189,12 +221,12 @@ def format_output(ticker: str, eps_growth: pd.DataFrame, rev_growth: pd.DataFram
     header = f"\nTicker: {ticker.upper()}  |  Growth mode: {mode.upper()}  |  Showing last {MAX_OUTPUT_PERIODS} quarters\n"
     lines = [header, "-" * len(header)]
 
-    # Diluted EPS
-    lines.append("\nDiluted EPS % Growth:")
+    # EPS
+    lines.append("\nEPS % Growth (Diluted preferred, else Basic):")
     if eps_growth.empty:
-        lines.append("  (No Diluted EPS data available.)")
+        lines.append("  (No EPS growth available — need at least 2 quarters of EPS.)")
     else:
-        lines.append("  Quarter End        Diluted EPS   vs Prior     % Growth")
+        lines.append("  Quarter End        EPS      vs Prior     % Growth")
         for idx, row in eps_growth.iterrows():
             lines.append(
                 f"  {idx.date()}   {row['value']:<10.4g} {row['compare_to']:<10.4g} {row['pct_growth']:>8.2f}%"
@@ -209,6 +241,7 @@ def format_output(ticker: str, eps_growth: pd.DataFrame, rev_growth: pd.DataFram
         for idx, row in rev_growth.iterrows():
             val = row["value"]
             prv = row["compare_to"]
+
             def fmt_money(x):
                 if abs(x) >= 1e9:
                     return f"{x/1e9:.3g}B"
@@ -223,7 +256,7 @@ def format_output(ticker: str, eps_growth: pd.DataFrame, rev_growth: pd.DataFram
     return "\n".join(lines)
 
 def main():
-    print("Yahoo Finance Diluted EPS & Revenue Growth (last 5 quarters)")
+    print("Yahoo Finance EPS (Diluted/Basic) & Revenue Growth (last 5 quarters)")
     print("Mode:", GROWTH_MODE.upper(), "(change GROWTH_MODE in the script to 'yoy' for year-over-year)\n")
     try:
         while True:

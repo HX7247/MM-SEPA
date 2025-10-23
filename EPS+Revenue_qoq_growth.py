@@ -2,29 +2,36 @@
 """
 EPS+Revenue_qoq_growth.py
 
-Compute EPS percentage difference (growth) for the last 5 quarters
-from Yahoo Finance via yfinance, with robust fallbacks.
+Fetch EPS and Revenue quarter-over-quarter (or year-over-year) percentage growth
+for the last 5 quarters using Yahoo Finance via the yfinance library.
 
 Usage:
     python EPS+Revenue_qoq_growth.py
-    (then enter a ticker, e.g., AAPL)
+    (then enter a ticker at the prompt)
+
+Dependencies:
+    pip install yfinance pandas python-dateutil
 """
 
+import sys
+import math
 import warnings
 from typing import Optional, Tuple
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 import yfinance as yf
 
-# ---------- Config ----------
-MAX_OUTPUT_PERIODS = 5        # how many most recent % changes to show
-GROWTH_MODE = "qoq"           # "qoq" (quarter-over-quarter) or "yoy" (same quarter last year)
-# ----------------------------
+# ------------ Config ------------
+# Choose "qoq" for quarter-over-quarter or "yoy" for year-over-year comparisons.
+GROWTH_MODE = "qoq"  
+MAX_OUTPUT_PERIODS = 5  # how many most-recent growth points to show
+# --------------------------------
 
-def pct_change(current: Optional[float], previous: Optional[float]) -> Optional[float]:
-    """Standard % change. Returns None if previous is 0 or missing."""
+def _pct_change(current: float, previous: float) -> Optional[float]:
+    """Safe percent change: (current/previous - 1)*100. Returns None when invalid."""
     try:
-        if current is None or previous is None:
+        if previous is None or current is None:
             return None
         if previous == 0:
             return None
@@ -32,130 +39,213 @@ def pct_change(current: Optional[float], previous: Optional[float]) -> Optional[
     except Exception:
         return None
 
-def extract_eps_series(tkr: yf.Ticker) -> pd.Series:
+def _prep_growth(series: pd.Series, mode: str = "qoq") -> pd.DataFrame:
     """
-    Try multiple sources to get a quarterly EPS series:
-      1) get_earnings_dates(limit=...) -> 'EPS Actual'
-      2) quarterly_earnings -> 'Earnings'
-    Returns a Series indexed by quarter end (Timestamp), values=float EPS.
+    Compute percentage growth for a time series indexed by datetime (ascending).
+    mode: "qoq" -> prior period; "yoy" -> same quarter one year earlier (approx by shifting 4).
+    Returns a DataFrame with columns: value, compare_to, pct_growth.
     """
-    # ---- Primary: earnings dates feed (EPS Actual) ----
+    s = series.dropna().sort_index()
+    if s.empty:
+        return pd.DataFrame(columns=["value", "compare_to", "pct_growth"])
+
+    df = pd.DataFrame({"value": s})
+    if mode.lower() == "yoy":
+        df["compare_to"] = df["value"].shift(4)
+    else:
+        df["compare_to"] = df["value"].shift(1)
+
+    df["pct_growth"] = [
+        _pct_change(cur, prv) for cur, prv in zip(df["value"], df["compare_to"])
+    ]
+    return df.dropna(subset=["pct_growth"])
+
+def _extract_eps_series(tkr: yf.Ticker) -> pd.Series:
+    """
+    Try to obtain a quarterly EPS actual series from Yahoo Finance.
+    Uses get_earnings_dates (preferred in yfinance>=0.2) and falls back where possible.
+    Index is the reported earnings date; values are EPS Actual (float).
+    """
+    # Try the newer method first
     eps_df = None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            eps_df = tkr.get_earnings_dates(limit=40)  # recent quarters
+            eps_df = tkr.get_earnings_dates(limit=40)  # returns most recent rows first typically
+        except Exception:
+            pass
+
+    if eps_df is None or eps_df.empty:
+        # Fallback attribute present in some versions
+        try:
+            eps_df = tkr.earnings_dates
         except Exception:
             eps_df = None
 
-    if eps_df is not None and not eps_df.empty:
-        # Find an EPS "actual/reported" column robustly
-        candidates = [c for c in eps_df.columns
-                      if "eps" in c.lower() and ("actual" in c.lower() or "reported" in c.lower())]
-        if candidates:
-            eps_col = candidates[0]
-            # Ensure datetime index
-            try:
-                if "Earnings Date" in eps_df.columns:
-                    eps_df = eps_df.set_index("Earnings Date")
-            except Exception:
-                pass
-            eps_df.index = pd.to_datetime(eps_df.index, errors="coerce")
-            eps_df = eps_df[eps_df.index.notna()]
-            ser = pd.to_numeric(eps_df[eps_col], errors="coerce").dropna()
-            if not ser.empty:
-                # Group by calendar quarter to deduplicate and take last
-                qidx = ser.index.to_period("Q")
-                ser = ser.groupby(qidx).last()
-                ser.index = ser.index.to_timestamp(how="end")
-                return ser.sort_index()
+    if eps_df is None or eps_df.empty:
+        return pd.Series(dtype=float)
 
-    # ---- Fallback: quarterly_earnings (often present) ----
-    qearn = getattr(tkr, "quarterly_earnings", None)
-    if qearn is not None and not qearn.empty:
-        qearn = qearn.sort_index()
-        # Some yfinance versions use column 'Earnings' for EPS
-        eps_col = None
-        for c in ["Earnings", "EPS", "Reported EPS"]:
-            if c in qearn.columns:
-                eps_col = c
-                break
-        if eps_col is None:
-            # Try a loose match
-            matches = [c for c in qearn.columns if "earn" in c.lower() or "eps" in c.lower()]
-            if matches:
-                eps_col = matches[0]
+    # Standardize columns: expect "EPS Actual"
+    # Some versions use "EPS Actual", "Reported EPS", etc. Try a few.
+    col_candidates = [c for c in eps_df.columns if "eps" in c.lower() and ("actual" in c.lower() or "reported" in c.lower())]
+    if not col_candidates:
+        return pd.Series(dtype=float)
 
-        if eps_col:
-            ser = pd.to_numeric(qearn[eps_col], errors="coerce")
-            # Index is a quarter label (e.g., '2024-03-31'); coerce to datetime
-            try:
-                ser.index = pd.to_datetime(qearn.index)
-            except Exception:
-                ser.index = pd.to_datetime(ser.index, errors="coerce")
-            ser = ser.dropna()
-            if not ser.empty:
-                ser.index = ser.index.to_period("Q").to_timestamp(how="end")
-                return ser.sort_index()
-
-    # Nothing found
-    return pd.Series(dtype=float)
-
-def compute_eps_growth(eps_series: pd.Series, mode: str = "qoq") -> pd.DataFrame:
-    """
-    Given an EPS series indexed by quarter end ascending, compute % difference.
-    mode: "qoq" (shift 1) or "yoy" (shift 4).
-    Returns DataFrame: columns [EPS, CompareTo, PctDiff], last MAX_OUTPUT_PERIODS rows.
-    """
-    s = eps_series.dropna().sort_index()
-    if s.empty:
-        return pd.DataFrame(columns=["EPS", "CompareTo", "PctDiff"])
-
-    df = pd.DataFrame({"EPS": s})
-    if mode.lower() == "yoy":
-        df["CompareTo"] = df["EPS"].shift(4)
+    eps_col = col_candidates[0]
+    # Ensure index is datetime
+    idx_col = None
+    if "Earnings Date" in eps_df.columns:
+        idx_col = "Earnings Date"
+        eps_df = eps_df.set_index("Earnings Date")
+    elif eps_df.index.name and "date" in str(eps_df.index.name).lower():
+        # already datetime-like index
+        pass
     else:
-        df["CompareTo"] = df["EPS"].shift(1)
+        # Try to coerce the first column to datetime index
+        try:
+            first_col = eps_df.columns[0]
+            maybe_dt = pd.to_datetime(eps_df[first_col], errors="coerce")
+            if maybe_dt.notna().any():
+                eps_df = eps_df.set_index(maybe_dt)
+            else:
+                eps_df.index = pd.to_datetime(eps_df.index, errors="coerce")
+        except Exception:
+            eps_df.index = pd.to_datetime(eps_df.index, errors="coerce")
 
-    df["PctDiff"] = [pct_change(cur, prv) for cur, prv in zip(df["EPS"], df["CompareTo"])]
-    df = df.dropna(subset=["PctDiff"])
+    eps_df.index = pd.to_datetime(eps_df.index, errors="coerce")
+    eps_df = eps_df[eps_df.index.notna()]
+    # Make ascending by time for consistent diffs
+    eps_df = eps_df.sort_index()
+    eps_series = pd.to_numeric(eps_df[eps_col], errors="coerce")
+    eps_series = eps_series.dropna()
+    # Some tickers have multiple entries per quarter (confirm/adjust). Keep the last per quarter.
+    # Group by calendar quarter and take the last reported EPS in that quarter.
+    if not eps_series.empty:
+        qidx = eps_series.index.to_period("Q")
+        eps_series = eps_series.groupby(qidx).last()
+        # Convert period back to timestamp (end of quarter) for neatness
+        eps_series.index = eps_series.index.to_timestamp(how="end")
+
+    return eps_series
+
+def _extract_revenue_series(tkr: yf.Ticker) -> pd.Series:
+    """
+    Get quarterly revenue series from ticker.quarterly_financials.
+    Returns a Series indexed by quarter end (datetime), values in currency units (float).
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        qfin = tkr.quarterly_financials
+
+    if qfin is None or qfin.empty:
+        return pd.Series(dtype=float)
+
+    # quarterly_financials has accounts as rows, columns are quarter end dates (Timestamp)
+    # Yahoo often uses 'Total Revenue' key; fall back to close matches.
+    row = None
+    for candidate in ["Total Revenue", "TotalRevenue", "totalRevenue", "Revenue", "Total revenue"]:
+        if candidate in qfin.index:
+            row = candidate
+            break
+
+    if row is None:
+        # Try fuzzy: match contains 'revenue'
+        rev_like = [idx for idx in qfin.index if "revenue" in str(idx).lower()]
+        if rev_like:
+            row = rev_like[0]
+
+    if row is None:
+        return pd.Series(dtype=float)
+
+    rev = pd.to_numeric(qfin.loc[row], errors="coerce")
+    # Columns are quarter ends; ensure datetime and ascending
+    rev.index = pd.to_datetime(rev.index, errors="coerce")
+    rev = rev.dropna()
+    rev = rev.sort_index()
+    return rev
+
+def fetch_growth_for_ticker(ticker: str, mode: str = GROWTH_MODE) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns two small tables (DataFrames):
+      eps_growth_df: index=quarter end (timestamp), columns=[value, compare_to, pct_growth]
+      rev_growth_df: index=quarter end (timestamp), columns=[value, compare_to, pct_growth]
+    Each trimmed to the most-recent MAX_OUTPUT_PERIODS rows.
+    """
+    tk = yf.Ticker(ticker)
+
+    # EPS
+    eps_series = _extract_eps_series(tk)
+    eps_growth_full = _prep_growth(eps_series, mode=mode)
+    eps_growth = eps_growth_full.tail(MAX_OUTPUT_PERIODS)
+
+    # Revenue
+    rev_series = _extract_revenue_series(tk)
+    rev_growth_full = _prep_growth(rev_series, mode=mode)
+    rev_growth = rev_growth_full.tail(MAX_OUTPUT_PERIODS)
+
     # Round for display
-    df["PctDiff"] = df["PctDiff"].astype(float).round(2)
-    return df.tail(MAX_OUTPUT_PERIODS)
+    for df in (eps_growth, rev_growth):
+        if not df.empty:
+            df["value"] = df["value"].astype(float)
+            df["compare_to"] = df["compare_to"].astype(float)
+            df["pct_growth"] = df["pct_growth"].astype(float).round(2)
 
-def format_table(ticker: str, mode: str, eps_growth: pd.DataFrame) -> str:
-    title = f"\nTicker: {ticker.upper()} | EPS % Difference ({mode.upper()}) | Last {MAX_OUTPUT_PERIODS} quarters"
-    lines = [title, "-" * len(title)]
+    return eps_growth, rev_growth
+
+def format_output(ticker: str, eps_growth: pd.DataFrame, rev_growth: pd.DataFrame, mode: str) -> str:
+    header = f"\nTicker: {ticker.upper()}  |  Growth mode: {mode.upper()}  |  Showing last {MAX_OUTPUT_PERIODS} quarters\n"
+    lines = [header, "-" * len(header)]
+
+    # EPS
+    lines.append("\nEPS % Growth:")
     if eps_growth.empty:
-        lines.append("No EPS data available for this ticker.")
-        return "\n".join(lines)
+        lines.append("  (No EPS data available.)")
+    else:
+        lines.append("  Quarter End        EPS      vs Prior     % Growth")
+        for idx, row in eps_growth.iterrows():
+            lines.append(
+                f"  {idx.date()}   {row['value']:<10.4g} {row['compare_to']:<10.4g} {row['pct_growth']:>8.2f}%"
+            )
 
-    lines.append("\nQuarter End        EPS        Compare-To     % Diff")
-    for idx, row in eps_growth.iterrows():
-        lines.append(
-            f"{idx.date()}    {row['EPS']:<10.4g} {row['CompareTo']:<12.4g} {row['PctDiff']:>8.2f}%"
-        )
+    # Revenue
+    lines.append("\nRevenue % Growth:")
+    if rev_growth.empty:
+        lines.append("  (No Revenue data available.)")
+    else:
+        lines.append("  Quarter End        Revenue         vs Prior         % Growth")
+        for idx, row in rev_growth.iterrows():
+            val = row["value"]
+            prv = row["compare_to"]
+            # show in billions if large
+            def fmt_money(x):
+                if abs(x) >= 1e9:
+                    return f"{x/1e9:.3g}B"
+                if abs(x) >= 1e6:
+                    return f"{x/1e6:.3g}M"
+                return f"{x:.3g}"
+
+            lines.append(
+                f"  {idx.date()}   {fmt_money(val):<15} {fmt_money(prv):<15} {row['pct_growth']:>8.2f}%"
+            )
+
     return "\n".join(lines)
 
 def main():
-    print("Yahoo Finance — Quarterly EPS % Difference")
-    print(f"Mode: {GROWTH_MODE.upper()}  (change GROWTH_MODE in the file to 'yoy' for year-over-year)\n")
-    while True:
-        try:
+    print("Yahoo Finance EPS & Revenue Growth (last 5 quarters)")
+    print("Mode:", GROWTH_MODE.upper(), "(change GROWTH_MODE in the script to 'yoy' for year-over-year)\n")
+    try:
+        while True:
             ticker = input("Enter a ticker (or press Enter to quit): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
-            break
-        if not ticker:
-            break
-        try:
-            tkr = yf.Ticker(ticker)
-            eps_series = extract_eps_series(tkr)
-            eps_growth = compute_eps_growth(eps_series, mode=GROWTH_MODE)
-            print(format_table(ticker, GROWTH_MODE, eps_growth))
-            print()
-        except Exception as e:
-            print(f"Error: {e}\n")
+            if not ticker:
+                break
+            try:
+                eps_g, rev_g = fetch_growth_for_ticker(ticker, mode=GROWTH_MODE)
+                print(format_output(ticker, eps_g, rev_g, GROWTH_MODE))
+                print()
+            except Exception as e:
+                print(f"Error fetching data for {ticker}: {e}\n")
+    except KeyboardInterrupt:
+        print("\nBye!")
 
 if __name__ == "__main__":
     main()
